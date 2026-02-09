@@ -1,6 +1,6 @@
 # Binaries
 bin/
-tcp-proxy
+/tcp-proxy
 
 # IDE
 .idea/

@@ -5,6 +5,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -41,6 +42,7 @@ type Config struct {
 	ListenAddr string
 
 	// UpstreamAddr is the address of the real API server to proxy to.
+	// For TLS mode, this should be the Ingress hostname:port (e.g., "tenant.k8s.example.com:443")
 	UpstreamAddr string
 
 	// ServiceName is the name of the tcp-proxy Service in kube-system.
@@ -54,14 +56,31 @@ type Config struct {
 
 	// Clientset is the Kubernetes client for managing EndpointSlices.
 	Clientset kubernetes.Interface
+
+	// TLSCertFile is the path to the TLS certificate file (API server cert).
+	// If empty, tcp-proxy operates in passthrough mode.
+	TLSCertFile string
+
+	// TLSKeyFile is the path to the TLS private key file.
+	TLSKeyFile string
+
+	// UpstreamSNI is the SNI hostname to use when connecting to upstream.
+	// Required for TLS mode when connecting through an Ingress.
+	// If empty, defaults to the host portion of UpstreamAddr.
+	UpstreamSNI string
+
+	// UpstreamInsecure skips TLS verification for upstream connections.
+	// Use only for testing.
+	UpstreamInsecure bool
 }
 
 // Server is the tcp-proxy server that handles both proxying and
 // EndpointSlice reconciliation.
 type Server struct {
-	config   Config
-	listener net.Listener
-	wg       sync.WaitGroup
+	config    Config
+	listener  net.Listener
+	tlsConfig *tls.Config
+	wg        sync.WaitGroup
 
 	// Metrics
 	activeConns   atomic.Int64
@@ -88,15 +107,38 @@ func (s *Server) Run(ctx context.Context) error {
 		s.reconcileLoop(ctx)
 	}()
 
-	// Start the TCP listener
+	// Determine if we're in TLS termination mode
+	tlsMode := s.config.TLSCertFile != "" && s.config.TLSKeyFile != ""
+
 	var err error
-	s.listener, err = net.Listen("tcp", s.config.ListenAddr)
-	if err != nil {
-		return fmt.Errorf("failed to listen on %s: %w", s.config.ListenAddr, err)
+	if tlsMode {
+		// Load TLS certificate
+		cert, err := tls.LoadX509KeyPair(s.config.TLSCertFile, s.config.TLSKeyFile)
+		if err != nil {
+			return fmt.Errorf("failed to load TLS certificate: %w", err)
+		}
+
+		s.tlsConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+
+		s.listener, err = tls.Listen("tcp", s.config.ListenAddr, s.tlsConfig)
+		if err != nil {
+			return fmt.Errorf("failed to listen on %s with TLS: %w", s.config.ListenAddr, err)
+		}
+		klog.Infof("TLS proxy listening on %s, forwarding to %s (SNI: %s)",
+			s.config.ListenAddr, s.config.UpstreamAddr, s.getUpstreamSNI())
+	} else {
+		// Plain TCP passthrough mode
+		s.listener, err = net.Listen("tcp", s.config.ListenAddr)
+		if err != nil {
+			return fmt.Errorf("failed to listen on %s: %w", s.config.ListenAddr, err)
+		}
+		klog.Infof("TCP proxy (passthrough) listening on %s, forwarding to %s",
+			s.config.ListenAddr, s.config.UpstreamAddr)
 	}
 	defer s.listener.Close()
-
-	klog.Infof("TCP proxy listening on %s, forwarding to %s", s.config.ListenAddr, s.config.UpstreamAddr)
 
 	// Close listener when context is cancelled
 	go func() {
@@ -118,7 +160,11 @@ func (s *Server) Run(ctx context.Context) error {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			s.handleConnection(ctx, conn)
+			if tlsMode {
+				s.handleTLSConnection(ctx, conn)
+			} else {
+				s.handleConnection(ctx, conn)
+			}
 		}()
 	}
 
@@ -128,7 +174,60 @@ func (s *Server) Run(ctx context.Context) error {
 	return nil
 }
 
+// getUpstreamSNI returns the SNI hostname to use for upstream connections.
+func (s *Server) getUpstreamSNI() string {
+	if s.config.UpstreamSNI != "" {
+		return s.config.UpstreamSNI
+	}
+	// Extract host from UpstreamAddr
+	host, _, err := net.SplitHostPort(s.config.UpstreamAddr)
+	if err != nil {
+		return s.config.UpstreamAddr
+	}
+	return host
+}
+
+// handleTLSConnection handles a TLS-terminated connection.
+// It terminates TLS from the client and establishes a new TLS connection
+// to the upstream with proper SNI.
+func (s *Server) handleTLSConnection(ctx context.Context, clientConn net.Conn) {
+	s.activeConns.Add(1)
+	s.totalConns.Add(1)
+	defer func() {
+		s.activeConns.Add(-1)
+		clientConn.Close()
+	}()
+
+	// The clientConn is already a TLS connection (from tls.Listen)
+	// Now connect to upstream with TLS and proper SNI
+	upstreamTLSConfig := &tls.Config{
+		ServerName:         s.getUpstreamSNI(),
+		InsecureSkipVerify: s.config.UpstreamInsecure,
+		MinVersion:         tls.VersionTLS12,
+	}
+
+	dialer := &tls.Dialer{
+		NetDialer: &net.Dialer{Timeout: 10 * time.Second},
+		Config:    upstreamTLSConfig,
+	}
+
+	upstreamConn, err := dialer.DialContext(ctx, "tcp", s.config.UpstreamAddr)
+	if err != nil {
+		klog.Errorf("Failed to connect to upstream %s (SNI: %s): %v",
+			s.config.UpstreamAddr, s.getUpstreamSNI(), err)
+		return
+	}
+	defer upstreamConn.Close()
+
+	klog.V(4).Infof("TLS proxying %s -> %s (SNI: %s)",
+		clientConn.RemoteAddr(), s.config.UpstreamAddr, s.getUpstreamSNI())
+
+	// Bidirectional copy of decrypted data
+	s.relayConnections(clientConn, upstreamConn, ctx)
+}
+
 // handleConnection proxies a single connection to the upstream server.
+// This is a simple TCP passthrough - all bytes are forwarded unchanged.
 func (s *Server) handleConnection(ctx context.Context, clientConn net.Conn) {
 	s.activeConns.Add(1)
 	s.totalConns.Add(1)
@@ -149,6 +248,11 @@ func (s *Server) handleConnection(ctx context.Context, clientConn net.Conn) {
 	klog.V(4).Infof("Proxying %s -> %s", clientConn.RemoteAddr(), s.config.UpstreamAddr)
 
 	// Bidirectional copy
+	s.relayConnections(clientConn, upstreamConn, ctx)
+}
+
+// relayConnections performs bidirectional data relay between two connections.
+func (s *Server) relayConnections(clientConn, upstreamConn net.Conn, ctx context.Context) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -158,7 +262,7 @@ func (s *Server) handleConnection(ctx context.Context, clientConn net.Conn) {
 		n, _ := io.Copy(upstreamConn, clientConn)
 		s.totalBytes.Add(n)
 		// Signal upstream we're done sending
-		if tc, ok := upstreamConn.(*net.TCPConn); ok {
+		if tc, ok := upstreamConn.(interface{ CloseWrite() error }); ok {
 			tc.CloseWrite()
 		}
 	}()
@@ -169,7 +273,7 @@ func (s *Server) handleConnection(ctx context.Context, clientConn net.Conn) {
 		n, _ := io.Copy(clientConn, upstreamConn)
 		s.totalBytes.Add(n)
 		// Signal client we're done sending
-		if tc, ok := clientConn.(*net.TCPConn); ok {
+		if tc, ok := clientConn.(interface{ CloseWrite() error }); ok {
 			tc.CloseWrite()
 		}
 	}()
