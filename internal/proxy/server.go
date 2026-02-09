@@ -263,7 +263,7 @@ func (s *Server) relayConnections(clientConn, upstreamConn net.Conn, ctx context
 		s.totalBytes.Add(n)
 		// Signal upstream we're done sending
 		if tc, ok := upstreamConn.(interface{ CloseWrite() error }); ok {
-			tc.CloseWrite()
+			_ = tc.CloseWrite()
 		}
 	}()
 
@@ -274,7 +274,7 @@ func (s *Server) relayConnections(clientConn, upstreamConn net.Conn, ctx context
 		s.totalBytes.Add(n)
 		// Signal client we're done sending
 		if tc, ok := clientConn.(interface{ CloseWrite() error }); ok {
-			tc.CloseWrite()
+			_ = tc.CloseWrite()
 		}
 	}()
 
